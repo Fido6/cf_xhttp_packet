@@ -3,7 +3,6 @@
 // - Keeps the same protocol: GET establishes downstream, POST uploads packet fragments with seq
 // - Parses first packet header (seq=0) and opens a TCP connection using cloudflare:sockets
 // - Supports optional reverse-proxy / HTTP CONNECT / SOCKS5 upstreams via PROXY_URL
-// - Removes subscription output route as requested
 
 import { connect } from "cloudflare:sockets";
 
@@ -40,11 +39,12 @@ type TunnelConnection = {
 };
 
 type Settings = {
-  seed: string;
+  Germ: string;
   pathSeg: string;
-  proxyUrl: string;
+  Proxyy: string;
   maxBufferedPosts: number;
   sessionTimeout: number;
+  idleTimeout: number;
   maxPostSize: number;
 };
 
@@ -68,11 +68,14 @@ export interface Env {
 
 function getSettings(env: Env): Settings {
   return {
-    seed: env.K_SIGIL || "58888888-8888-8888-8888-888888888888",
+    Germ: env.K_SIGIL || "58888888-8888-8888-8888-888888888888",
     pathSeg: env.P_SIGIL || "xhttp",
-    proxyUrl: env.PROXY_URL?.trim() || "",
+    Proxyy: env.PROXY_URL?.trim() || "",
     maxBufferedPosts: 30,
     sessionTimeout: 30_000,
+    // Close long-lived sessions that have no traffic to reduce DO duration usage.
+    // (Free tier has a strict duration quota.)
+    idleTimeout: 60_000,
     maxPostSize: 1_000_000,
   };
 }
@@ -757,6 +760,7 @@ export class SessionDO implements DurableObject {
   private downstreamStarted = false;
   private cleaned = false;
   private pendingBuffers: Map<number, Bytes> = new Map();
+  private lastActiveAt = Date.now();
 
   private hInfo: FirstPktMeta | null = null;
   private proxyUrlOverride: string | null = null;
@@ -801,6 +805,7 @@ export class SessionDO implements DurableObject {
     if (req.method === "GET" && seq === null) {
       log(this.env, `[DO ${sid}] GET downstream open`);
       this.downstreamStarted = true;
+      this.touch(settings);
 
       const { readable, writable } = new TransformStream<Bytes, Bytes>();
       this.downstream = writable;
@@ -813,7 +818,7 @@ export class SessionDO implements DurableObject {
         status: 200,
         headers: {
           ...headers,
-          "Content-Type": "image/jpeg",
+          "Content-Type": "application/x-javascript",
           "Transfer-Encoding": "chunked",
         },
       });
@@ -853,8 +858,8 @@ export class SessionDO implements DurableObject {
     if (this.initialized) return;
 
     try {
-      this.hInfo = await parseHeader(settings.seed, firstPacket);
-      const activeProxyUrl = this.proxyUrlOverride || settings.proxyUrl;
+      this.hInfo = await parseHeader(settings.Germ, firstPacket);
+      const activeProxyUrl = this.proxyUrlOverride || settings.Proxyy;
       const proxy = activeProxyUrl ? parseProxyUrl(activeProxyUrl) : null;
       if (proxy) {
         log(
@@ -884,6 +889,7 @@ export class SessionDO implements DurableObject {
   private async processPacket(seq: number, data: Bytes, settings: Settings): Promise<void> {
     if (this.cleaned) throw new Error("session closed");
 
+    this.touch(settings);
     this.pendingBuffers.set(seq, data);
 
     while (this.pendingBuffers.has(this.nextSeq)) {
@@ -916,6 +922,8 @@ export class SessionDO implements DurableObject {
     if (!this.downstream || !this.hInfo || !this.connection) return;
     if (this.aborter) return;
 
+    const settings = getSettings(this.env);
+
     log(this.env, `[DO pipe] start downstream piping from ${this.hInfo.hostname}:${this.hInfo.port}`);
     this.aborter = new AbortController();
 
@@ -923,6 +931,14 @@ export class SessionDO implements DurableObject {
     const upstream = this.connection.readable;
     const signal = this.aborter.signal;
     const respHeader = this.hInfo.resp;
+
+    // Tap downstream traffic to update lastActiveAt and refresh alarm.
+    const tap = new TransformStream<Bytes, Bytes>({
+      transform: (chunk, controller) => {
+        this.touch(settings);
+        controller.enqueue(chunk);
+      },
+    });
 
     (async () => {
       if (!this.responseHeaderSent) {
@@ -935,7 +951,7 @@ export class SessionDO implements DurableObject {
         }
       }
 
-      await upstream.pipeTo(downstream, { signal });
+      await upstream.pipeThrough(tap).pipeTo(downstream, { signal });
     })()
       .catch((err) => {
         log(this.env, `[DO pipe] ERROR`, err);
@@ -946,9 +962,31 @@ export class SessionDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
+    const settings = getSettings(this.env);
+
+    // If no downstream ever established, cleanup quickly.
     if (!this.downstreamStarted) {
       this.cleanup();
+      return;
     }
+
+    // If downstream exists but no traffic for a while, close it to avoid free-tier duration burn.
+    const idleFor = Date.now() - this.lastActiveAt;
+    if (idleFor >= settings.idleTimeout) {
+      log(this.env, `[DO alarm] idle timeout reached (${idleFor}ms), closing session`);
+      this.cleanup();
+      return;
+    }
+
+    // Still active; re-arm.
+    await this.state.storage.setAlarm(Date.now() + (settings.idleTimeout - idleFor));
+  }
+
+  private touch(settings: Settings): void {
+    this.lastActiveAt = Date.now();
+    // Always keep an alarm scheduled so we can terminate idle sessions.
+    // Best-effort; ignore failures.
+    this.state.storage.setAlarm(this.lastActiveAt + settings.idleTimeout).catch(() => {});
   }
 
   private cleanup(): void {
